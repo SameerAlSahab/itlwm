@@ -29,6 +29,10 @@ bool AirportItlwm::init(OSDictionary *properties)
     bool ret = super::init(properties);
     awdlSyncEnable = true;
     power_state = 0;
+    fAWDLInterface = fP2PDISCInterface = fP2PGOInterface = NULL;
+    // Escape hatch for Ventura+: boot-arg -itlwm_novif restores the old "no virtual interfaces" behaviour.
+    int vifOff = 0;
+    fDisableVirtualIf = PE_parse_boot_argn("-itlwm_novif", &vifOff, sizeof(vifOff));
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
     return ret;
 }
@@ -149,6 +153,8 @@ void AirportItlwm::associateSSID(uint8_t *ssid, uint32_t ssid_len, const struct 
     bzero(&wpa, sizeof(wpa));
     bzero(&nwkey, sizeof(nwkey));
     
+    if (ssid_len > IEEE80211_NWID_LEN)
+        ssid_len = IEEE80211_NWID_LEN;
     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
     memcpy(ic->ic_des_essid, ssid, ssid_len);
     ic->ic_des_esslen = ssid_len;
@@ -702,21 +708,23 @@ UInt32 AirportItlwm::outputPacket(mbuf_t m, void *param)
             freePacket(m);
         return kIOReturnOutputDropped;
     }
+    // Every bad-packet case must return: continuing would dereference NULL or
+    // enqueue an mbuf that was just freed.
     if (m == NULL) {
         XYLog("%s m==NULL!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     if (!(mbuf_flags(m) & MBUF_PKTHDR) ){
         XYLog("%s pkthdr is NULL!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
         freePacket(m);
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     if (mbuf_type(m) == MBUF_TYPE_FREE) {
         XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     if (!ifp->if_snd.queue->lockEnqueue(m)) {
         freePacket(m);
@@ -917,6 +925,10 @@ void AirportItlwm::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOn;
+    // setPowerStateOff() stopped the adapter. getPOWER() still reports the radio as on, so
+    // wifid never toggles it again; bring it back here (HAL enable() is idempotent).
+    if (fNetIf && power_state)
+        enableAdapter(fNetIf);
     pmPolicyMaker->acknowledgeSetPowerState();
 }
 

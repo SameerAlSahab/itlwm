@@ -1,0 +1,34 @@
+name: Test build
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install MacKernelSDK
+      run: git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+
+    - name: Build AirportItlwm (all macOS variants incl. Ventura)
+      run: |
+        set -o pipefail
+        xcodebuild -scheme "AirportItlwm (all)" -configuration ${{ matrix.configuration }} \
+          -derivedDataPath build | xcpretty
+
+    - name: Pack
+      run: |
+        cd build/Build/Products/${{ matrix.configuration }}
+        for d in */; do d="${d%/}"; zip -qry "../../../../AirportItlwm-${d// /_}-${{ matrix.configuration }}.zip" "$d"; done
+        ls -la ../../../../*.zip
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: AirportItlwm-${{ matrix.configuration }}
+        path: AirportItlwm-*.zip
+        if-no-files-found: error

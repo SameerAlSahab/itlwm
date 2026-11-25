@@ -1,0 +1,414 @@
+From 3c0af028196fb4fc4e5520d57e925f4180dcc520 Mon Sep 17 00:00:00 2001
+From: dev <dev@x>
+Date: Wed, 25 Nov 2026 08:17:15 +0000
+Subject: [PATCH] AirportItlwm: re-enable AWDL/P2P on Ventura, fix sleep/wake
+ re-enable, TX NULL deref, VIF use-after-free, SSID handling, assoc status
+
+---
+ .github/workflows/test-build.yml              |  34 ++++++
+ AirportItlwm/AirportItlwm.cpp                 |  18 ++-
+ AirportItlwm/AirportItlwm.hpp                 |   1 +
+ AirportItlwm/AirportItlwmSkywalkInterface.cpp |  22 +++-
+ AirportItlwm/AirportItlwmV2.cpp               |  11 +-
+ AirportItlwm/AirportSTAIOCTL.cpp              | 103 +++++++++++-------
+ 6 files changed, 142 insertions(+), 47 deletions(-)
+ create mode 100644 .github/workflows/test-build.yml
+
+diff --git a/.github/workflows/test-build.yml b/.github/workflows/test-build.yml
+new file mode 100644
+index 0000000..ca809ea
+--- /dev/null
++++ b/.github/workflows/test-build.yml
+@@ -0,0 +1,34 @@
++name: Test build
++
++on: [push, pull_request, workflow_dispatch]
++
++jobs:
++  build:
++    runs-on: macos-latest
++    strategy:
++      matrix:
++        configuration: [Debug, Release]
++
++    steps:
++    - uses: actions/checkout@v4
++
++    - name: Install MacKernelSDK
++      run: git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
++
++    - name: Build AirportItlwm (all macOS variants incl. Ventura)
++      run: |
++        set -o pipefail
++        xcodebuild -scheme "AirportItlwm (all)" -configuration ${{ matrix.configuration }} \
++          -derivedDataPath build | xcpretty
++
++    - name: Pack
++      run: |
++        cd build/Build/Products/${{ matrix.configuration }}
++        for d in */; do d="${d%/}"; zip -qry "../../../../AirportItlwm-${d// /_}-${{ matrix.configuration }}.zip" "$d"; done
++        ls -la ../../../../*.zip
++
++    - uses: actions/upload-artifact@v4
++      with:
++        name: AirportItlwm-${{ matrix.configuration }}
++        path: AirportItlwm-*.zip
++        if-no-files-found: error
+diff --git a/AirportItlwm/AirportItlwm.cpp b/AirportItlwm/AirportItlwm.cpp
+index 3cd3013..f4e2a21 100644
+--- a/AirportItlwm/AirportItlwm.cpp
++++ b/AirportItlwm/AirportItlwm.cpp
+@@ -29,6 +29,10 @@ bool AirportItlwm::init(OSDictionary *properties)
+     bool ret = super::init(properties);
+     awdlSyncEnable = true;
+     power_state = 0;
++    fAWDLInterface = fP2PDISCInterface = fP2PGOInterface = NULL;
++    // Escape hatch for Ventura+: boot-arg -itlwm_novif restores the old "no virtual interfaces" behaviour.
++    int vifOff = 0;
++    fDisableVirtualIf = PE_parse_boot_argn("-itlwm_novif", &vifOff, sizeof(vifOff));
+     memset(geo_location_cc, 0, sizeof(geo_location_cc));
+     return ret;
+ }
+@@ -149,6 +153,8 @@ void AirportItlwm::associateSSID(uint8_t *ssid, uint32_t ssid_len, const struct
+     bzero(&wpa, sizeof(wpa));
+     bzero(&nwkey, sizeof(nwkey));
+     
++    if (ssid_len > IEEE80211_NWID_LEN)
++        ssid_len = IEEE80211_NWID_LEN;
+     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+     memcpy(ic->ic_des_essid, ssid, ssid_len);
+     ic->ic_des_esslen = ssid_len;
+@@ -702,21 +708,23 @@ UInt32 AirportItlwm::outputPacket(mbuf_t m, void *param)
+             freePacket(m);
+         return kIOReturnOutputDropped;
+     }
++    // Every bad-packet case must return: continuing would dereference NULL or
++    // enqueue an mbuf that was just freed.
+     if (m == NULL) {
+         XYLog("%s m==NULL!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     if (!(mbuf_flags(m) & MBUF_PKTHDR) ){
+         XYLog("%s pkthdr is NULL!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+         freePacket(m);
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     if (mbuf_type(m) == MBUF_TYPE_FREE) {
+         XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     if (!ifp->if_snd.queue->lockEnqueue(m)) {
+         freePacket(m);
+@@ -917,6 +925,10 @@ void AirportItlwm::setPowerStateOn()
+ {
+     XYLog("%s\n", __FUNCTION__);
+     pmPowerState = kPowerStateOn;
++    // setPowerStateOff() stopped the adapter. getPOWER() still reports the radio as on, so
++    // wifid never toggles it again; bring it back here (HAL enable() is idempotent).
++    if (fNetIf && power_state)
++        enableAdapter(fNetIf);
+     pmPolicyMaker->acknowledgeSetPowerState();
+ }
+ 
+diff --git a/AirportItlwm/AirportItlwm.hpp b/AirportItlwm/AirportItlwm.hpp
+index 2bd0ceb..1850d6d 100644
+--- a/AirportItlwm/AirportItlwm.hpp
++++ b/AirportItlwm/AirportItlwm.hpp
+@@ -270,6 +270,7 @@ public:
+     IO80211P2PInterface *fP2PDISCInterface;
+     IO80211P2PInterface *fP2PGOInterface;
+     IO80211P2PInterface *fAWDLInterface;
++    bool fDisableVirtualIf;
+     
+     //AWDL
+     uint8_t *syncFrameTemplate;
+diff --git a/AirportItlwm/AirportItlwmSkywalkInterface.cpp b/AirportItlwm/AirportItlwmSkywalkInterface.cpp
+index 7ac518c..c434004 100644
+--- a/AirportItlwm/AirportItlwmSkywalkInterface.cpp
++++ b/AirportItlwm/AirportItlwmSkywalkInterface.cpp
+@@ -104,6 +104,8 @@ void AirportItlwmSkywalkInterface::associateSSID(uint8_t *ssid, uint32_t ssid_le
+     bzero(&wpa, sizeof(wpa));
+     bzero(&nwkey, sizeof(nwkey));
+     
++    if (ssid_len > IEEE80211_NWID_LEN)
++        ssid_len = IEEE80211_NWID_LEN;
+     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+     memcpy(ic->ic_des_essid, ssid, ssid_len);
+     ic->ic_des_esslen = ssid_len;
+@@ -295,8 +297,10 @@ getSSID(struct apple80211_ssid_data *sd)
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         memset(sd, 0, sizeof(*sd));
+         sd->version = APPLE80211_VERSION;
+-        memcpy(sd->ssid_bytes, ic->ic_des_essid, strlen((const char*)ic->ic_des_essid));
+-        sd->ssid_len = (uint32_t)strlen((const char*)ic->ic_des_essid);
++        // strlen() overruns for a 32 byte SSID (no NUL) and truncates SSIDs with NULs.
++        uint32_t n = ic->ic_des_esslen > IEEE80211_NWID_LEN ? IEEE80211_NWID_LEN : ic->ic_des_esslen;
++        memcpy(sd->ssid_bytes, ic->ic_des_essid, n);
++        sd->ssid_len = n;
+         return kIOReturnSuccess;
+     }
+     return 6;
+@@ -323,9 +327,16 @@ IOReturn AirportItlwmSkywalkInterface::
+ setCIPHER_KEY(struct apple80211_key *key)
+ {
+     XYLog("%s\n", __FUNCTION__);
++#ifdef DEBUG
+     const char* keydump = hexdump(key->key, key->key_len);
+     const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
+     const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
++#else
++    // Never write PTK/GTK key material to the log in release builds.
++    const char* keydump = nullptr;
++    const char* rscdump = nullptr;
++    const char* eadump = nullptr;
++#endif
+     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
+     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
+     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
+@@ -335,7 +346,8 @@ setCIPHER_KEY(struct apple80211_key *key)
+         XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
+               key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
+     else
+-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
++        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d\n",
++              key->key_len, key->key_cipher_type, key->key_flags, key->key_index);
+     
+     if (keydump)
+         IOFree((void*)keydump, 3 * key->key_len + 1);
+@@ -729,6 +741,8 @@ getNSS(struct apple80211_nss_data *data)
+ IOReturn AirportItlwmSkywalkInterface::
+ setASSOCIATE(struct apple80211_assoc_data *ad)
+ {
++    if (!ad)
++        return kIOReturnError;
+     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
+           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
+           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
+@@ -847,6 +861,8 @@ getASSOCIATION_STATUS(struct apple80211_assoc_status_data *hv)
+     hv->version = APPLE80211_VERSION;
+     if (ic->ic_state == IEEE80211_S_RUN)
+         hv->status = APPLE80211_STATUS_SUCCESS;
++    else if (ic->ic_assoc_status != 0 && ic->ic_assoc_status != APPLE80211_STATUS_UNAVAILABLE)
++        hv->status = ic->ic_assoc_status;   // real status code from the AP's (re)association response
+     else
+         hv->status = APPLE80211_STATUS_UNAVAILABLE;
+ //    XYLog("%s, %d\n", __FUNCTION__, hv->status);
+diff --git a/AirportItlwm/AirportItlwmV2.cpp b/AirportItlwm/AirportItlwmV2.cpp
+index 9d0485f..a86bd47 100644
+--- a/AirportItlwm/AirportItlwmV2.cpp
++++ b/AirportItlwm/AirportItlwmV2.cpp
+@@ -548,21 +548,23 @@ UInt32 AirportItlwm::outputPacket(mbuf_t m, void *param)
+             freePacket(m);
+         return kIOReturnOutputDropped;
+     }
++    // Every bad-packet case must return: continuing would dereference NULL or
++    // enqueue an mbuf that was just freed.
+     if (m == NULL) {
+         XYLog("%s m==NULL!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     if (!(mbuf_flags(m) & MBUF_PKTHDR) ){
+         XYLog("%s pkthdr is NULL!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+         freePacket(m);
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     if (mbuf_type(m) == MBUF_TYPE_FREE) {
+         XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
+         ifp->netStat->outputErrors++;
+-        ret = kIOReturnOutputDropped;
++        return kIOReturnOutputDropped;
+     }
+     size_t len = mbuf_len(m);
+     ether_header_t *eh = (ether_header_t *)mbuf_data(m);
+@@ -1049,5 +1051,8 @@ void AirportItlwm::setPowerStateOn()
+ {
+     XYLog("%s\n", __FUNCTION__);
+     pmPowerState = kPowerStateOn;
++    // See the legacy driver: the adapter was stopped in setPowerStateOff() and nothing else restarts it.
++    if (bsdInterface && power_state)
++        enableAdapter(bsdInterface);
+     pmPolicyMaker->acknowledgeSetPowerState();
+ }
+diff --git a/AirportItlwm/AirportSTAIOCTL.cpp b/AirportItlwm/AirportSTAIOCTL.cpp
+index c87deee..a74486a 100644
+--- a/AirportItlwm/AirportSTAIOCTL.cpp
++++ b/AirportItlwm/AirportSTAIOCTL.cpp
+@@ -221,8 +221,10 @@ getSSID(OSObject *object,
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         memset(sd, 0, sizeof(*sd));
+         sd->version = APPLE80211_VERSION;
+-        memcpy(sd->ssid_bytes, ic->ic_des_essid, strlen((const char*)ic->ic_des_essid));
+-        sd->ssid_len = (uint32_t)strlen((const char*)ic->ic_des_essid);
++        // strlen() overruns for a 32 byte SSID (no NUL) and truncates SSIDs with NULs.
++        uint32_t n = ic->ic_des_esslen > IEEE80211_NWID_LEN ? IEEE80211_NWID_LEN : ic->ic_des_esslen;
++        memcpy(sd->ssid_bytes, ic->ic_des_essid, n);
++        sd->ssid_len = n;
+         return kIOReturnSuccess;
+     }
+     return 6;
+@@ -255,9 +257,16 @@ IOReturn AirportItlwm::
+ setCIPHER_KEY(OSObject *object, struct apple80211_key *key)
+ {
+     XYLog("%s\n", __FUNCTION__);
++#ifdef DEBUG
+     const char* keydump = hexdump(key->key, key->key_len);
+     const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
+     const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
++#else
++    // Never write PTK/GTK key material to the log in release builds.
++    const char* keydump = nullptr;
++    const char* rscdump = nullptr;
++    const char* eadump = nullptr;
++#endif
+     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
+     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
+     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
+@@ -267,7 +276,8 @@ setCIPHER_KEY(OSObject *object, struct apple80211_key *key)
+         XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
+               key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
+     else
+-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
++        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d\n",
++              key->key_len, key->key_cipher_type, key->key_flags, key->key_index);
+     
+     if (keydump)
+         IOFree((void*)keydump, 3 * key->key_len + 1);
+@@ -1025,6 +1035,8 @@ IOReturn AirportItlwm::
+ setASSOCIATE(OSObject *object,
+                              struct apple80211_assoc_data *ad)
+ {
++    if (!ad)
++        return kIOReturnError;
+     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
+           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
+           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
+@@ -1163,6 +1175,8 @@ getASSOCIATION_STATUS(OSObject *object, struct apple80211_assoc_status_data *hv)
+     hv->version = APPLE80211_VERSION;
+     if (ic->ic_state == IEEE80211_S_RUN)
+         hv->status = APPLE80211_STATUS_SUCCESS;
++    else if (ic->ic_assoc_status != 0 && ic->ic_assoc_status != APPLE80211_STATUS_UNAVAILABLE)
++        hv->status = ic->ic_assoc_status;   // real status code from the AP's (re)association response
+     else
+         hv->status = APPLE80211_STATUS_UNAVAILABLE;
+ //    XYLog("%s, %d\n", __FUNCTION__, hv->status);
+@@ -1453,59 +1467,72 @@ getSCAN_RESULT(OSObject *object, struct apple80211_scan_result **sr)
+ IOReturn AirportItlwm::
+ setVIRTUAL_IF_CREATE(OSObject *object, struct apple80211_virt_if_create_data* data)
+ {
+-    // From Ventura, the virtual interface sequence has channged, now temporary disabled the virtual interface creation because it is no functionality. This fix the issue of delaying start time of associating to AP.
+-#if __IO80211_TARGET >= __MAC_13_0
+-    return kIOReturnUnsupported;
+-#else
++    // AirPlay, Handoff, AirDrop and Instant Hotspot need awdl0/p2p0 to exist, even though Intel
++    // firmware cannot run real AWDL. Ventura used to refuse every request here (commit a9d0ea9),
++    // which is why those features only worked on Monterey and Sonoma. They are enabled again;
++    // boot-arg -itlwm_novif restores the old behaviour if associating becomes slow on your setup.
++    if (fDisableVirtualIf)
++        return kIOReturnUnsupported;
++    if (!data)
++        return kIOReturnBadArgument;
++
+     struct ether_addr addr;
+-    struct apple80211_channel chann;
+     XYLog("%s role=%d, bsd_name=%s, mac=%s, unk1=%d\n", __FUNCTION__, data->role, data->bsd_name,
+           ether_sprintf(data->mac), data->unk1);
+-    if (data->role == APPLE80211_VIF_P2P_DEVICE) {
+-        IO80211P2PInterface *inf = new IO80211P2PInterface;
+-        if (inf == NULL)
+-            return kIOReturnError;
+-        memcpy(addr.octet, data->mac, 6);
+-        inf->init(this, &addr, data->role, "p2p");
+-        fP2PDISCInterface = inf;
+-    } else if (data->role == APPLE80211_VIF_P2P_GO) {
+-        IO80211P2PInterface *inf = new IO80211P2PInterface;
+-        if (inf == NULL)
+-            return kIOReturnError;
+-        memcpy(addr.octet, data->mac, 6);
+-        inf->init(this, &addr, data->role, "p2p");
+-        fP2PGOInterface = inf;
+-    } else if (data->role == APPLE80211_VIF_AWDL) {
+-        if (fAWDLInterface != NULL && strncmp((const char *)data->bsd_name, "awdl", 4) == 0) {
+-            XYLog("%s awdl interface already exists!\n", __FUNCTION__);
+-            return kIOReturnSuccess;
+-        }
+-        IO80211P2PInterface *inf = new IO80211P2PInterface;
+-        if (inf == NULL)
++    memcpy(addr.octet, data->mac, 6);
++
++    IO80211P2PInterface **slot = NULL;
++    const char *vifName = NULL;
++    switch (data->role) {
++        case APPLE80211_VIF_P2P_DEVICE: slot = &fP2PDISCInterface; vifName = "p2p";  break;
++        case APPLE80211_VIF_P2P_GO:     slot = &fP2PGOInterface;   vifName = "p2p";  break;
++        case APPLE80211_VIF_AWDL:       slot = &fAWDLInterface;    vifName = "awdl"; break;
++        default:
++            XYLog("%s unhandled virtual interface role type: %d\n", __FUNCTION__, data->role);
+             return kIOReturnError;
+-        memcpy(addr.octet, data->mac, 6);
+-        inf->init(this, &addr, data->role, "awdl");
++    }
++    if (*slot != NULL) {   // already created: do not leak or replace the live one
++        XYLog("%s %s interface already exists!\n", __FUNCTION__, vifName);
++        return kIOReturnSuccess;
++    }
++
++    IO80211P2PInterface *inf = new IO80211P2PInterface;
++    if (inf == NULL)
++        return kIOReturnError;
++    if (!inf->init(this, &addr, data->role, vifName)) {
++        inf->release();
++        return kIOReturnError;
++    }
++#if __IO80211_TARGET < __MAC_13_0
++    // Pre-Ventura only: forcing a fake infra channel here is a suspect for Ventura's slow join,
++    // so it is skipped there (AWDL is a stub on this hardware anyway).
++    if (data->role == APPLE80211_VIF_AWDL) {
++        struct apple80211_channel chann;
+         chann.channel = 149;
+         chann.version = 1;
+         chann.flags = APPLE80211_C_FLAG_5GHZ | APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_80MHZ;
+         setInfraChannel(&chann);
+-        fAWDLInterface = inf;
+-    } else {
+-        XYLog("%s unhandled virtual interface role type: %d\n", __FUNCTION__, data->role);
+-        return kIOReturnError;
+     }
+-    return kIOReturnSuccess;
+ #endif
++    *slot = inf;
++    return kIOReturnSuccess;
+ }
+ 
+ IOReturn AirportItlwm::
+ setVIRTUAL_IF_DELETE(OSObject *object, struct apple80211_virt_if_delete_data *data)
+ {
+-    XYLog("%s bsd_name=%s\n", __FUNCTION__, data->bsd_name);
+-    //TODO find vif according to the bsd_name
++    XYLog("%s bsd_name=%s\n", __FUNCTION__, data ? (const char *)data->bsd_name : "?");
+     IO80211VirtualInterface *vif = OSDynamicCast(IO80211VirtualInterface, object);
+     if (vif == NULL)
+         return kIOReturnError;
++    // wifid deletes and recreates these around sleep/wake. Clear our pointer first, otherwise
++    // setLinkStateGated() later touches a freed interface.
++    if ((IO80211VirtualInterface *)fAWDLInterface == vif)
++        fAWDLInterface = NULL;
++    if ((IO80211VirtualInterface *)fP2PDISCInterface == vif)
++        fP2PDISCInterface = NULL;
++    if ((IO80211VirtualInterface *)fP2PGOInterface == vif)
++        fP2PGOInterface = NULL;
+     detachVirtualInterface(vif, false);
+     vif->release();
+     return kIOReturnSuccess;
+-- 
+2.43.0
+

@@ -221,8 +221,10 @@ getSSID(OSObject *object,
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(sd, 0, sizeof(*sd));
         sd->version = APPLE80211_VERSION;
-        memcpy(sd->ssid_bytes, ic->ic_des_essid, strlen((const char*)ic->ic_des_essid));
-        sd->ssid_len = (uint32_t)strlen((const char*)ic->ic_des_essid);
+        // strlen() overruns for a 32 byte SSID (no NUL) and truncates SSIDs with NULs.
+        uint32_t n = ic->ic_des_esslen > IEEE80211_NWID_LEN ? IEEE80211_NWID_LEN : ic->ic_des_esslen;
+        memcpy(sd->ssid_bytes, ic->ic_des_essid, n);
+        sd->ssid_len = n;
         return kIOReturnSuccess;
     }
     return 6;
@@ -255,9 +257,16 @@ IOReturn AirportItlwm::
 setCIPHER_KEY(OSObject *object, struct apple80211_key *key)
 {
     XYLog("%s\n", __FUNCTION__);
+#ifdef DEBUG
     const char* keydump = hexdump(key->key, key->key_len);
     const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
     const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
+#else
+    // Never write PTK/GTK key material to the log in release builds.
+    const char* keydump = nullptr;
+    const char* rscdump = nullptr;
+    const char* eadump = nullptr;
+#endif
     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
@@ -267,7 +276,8 @@ setCIPHER_KEY(OSObject *object, struct apple80211_key *key)
         XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
               key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
     else
-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
+        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d\n",
+              key->key_len, key->key_cipher_type, key->key_flags, key->key_index);
     
     if (keydump)
         IOFree((void*)keydump, 3 * key->key_len + 1);
@@ -1025,6 +1035,8 @@ IOReturn AirportItlwm::
 setASSOCIATE(OSObject *object,
                              struct apple80211_assoc_data *ad)
 {
+    if (!ad)
+        return kIOReturnError;
     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
@@ -1163,6 +1175,8 @@ getASSOCIATION_STATUS(OSObject *object, struct apple80211_assoc_status_data *hv)
     hv->version = APPLE80211_VERSION;
     if (ic->ic_state == IEEE80211_S_RUN)
         hv->status = APPLE80211_STATUS_SUCCESS;
+    else if (ic->ic_assoc_status != 0 && ic->ic_assoc_status != APPLE80211_STATUS_UNAVAILABLE)
+        hv->status = ic->ic_assoc_status;   // real status code from the AP's (re)association response
     else
         hv->status = APPLE80211_STATUS_UNAVAILABLE;
 //    XYLog("%s, %d\n", __FUNCTION__, hv->status);
@@ -1453,59 +1467,72 @@ getSCAN_RESULT(OSObject *object, struct apple80211_scan_result **sr)
 IOReturn AirportItlwm::
 setVIRTUAL_IF_CREATE(OSObject *object, struct apple80211_virt_if_create_data* data)
 {
-    // From Ventura, the virtual interface sequence has channged, now temporary disabled the virtual interface creation because it is no functionality. This fix the issue of delaying start time of associating to AP.
-#if __IO80211_TARGET >= __MAC_13_0
-    return kIOReturnUnsupported;
-#else
+    // AirPlay, Handoff, AirDrop and Instant Hotspot need awdl0/p2p0 to exist, even though Intel
+    // firmware cannot run real AWDL. Ventura used to refuse every request here (commit a9d0ea9),
+    // which is why those features only worked on Monterey and Sonoma. They are enabled again;
+    // boot-arg -itlwm_novif restores the old behaviour if associating becomes slow on your setup.
+    if (fDisableVirtualIf)
+        return kIOReturnUnsupported;
+    if (!data)
+        return kIOReturnBadArgument;
+
     struct ether_addr addr;
-    struct apple80211_channel chann;
     XYLog("%s role=%d, bsd_name=%s, mac=%s, unk1=%d\n", __FUNCTION__, data->role, data->bsd_name,
           ether_sprintf(data->mac), data->unk1);
-    if (data->role == APPLE80211_VIF_P2P_DEVICE) {
-        IO80211P2PInterface *inf = new IO80211P2PInterface;
-        if (inf == NULL)
+    memcpy(addr.octet, data->mac, 6);
+
+    IO80211P2PInterface **slot = NULL;
+    const char *vifName = NULL;
+    switch (data->role) {
+        case APPLE80211_VIF_P2P_DEVICE: slot = &fP2PDISCInterface; vifName = "p2p";  break;
+        case APPLE80211_VIF_P2P_GO:     slot = &fP2PGOInterface;   vifName = "p2p";  break;
+        case APPLE80211_VIF_AWDL:       slot = &fAWDLInterface;    vifName = "awdl"; break;
+        default:
+            XYLog("%s unhandled virtual interface role type: %d\n", __FUNCTION__, data->role);
             return kIOReturnError;
-        memcpy(addr.octet, data->mac, 6);
-        inf->init(this, &addr, data->role, "p2p");
-        fP2PDISCInterface = inf;
-    } else if (data->role == APPLE80211_VIF_P2P_GO) {
-        IO80211P2PInterface *inf = new IO80211P2PInterface;
-        if (inf == NULL)
-            return kIOReturnError;
-        memcpy(addr.octet, data->mac, 6);
-        inf->init(this, &addr, data->role, "p2p");
-        fP2PGOInterface = inf;
-    } else if (data->role == APPLE80211_VIF_AWDL) {
-        if (fAWDLInterface != NULL && strncmp((const char *)data->bsd_name, "awdl", 4) == 0) {
-            XYLog("%s awdl interface already exists!\n", __FUNCTION__);
-            return kIOReturnSuccess;
-        }
-        IO80211P2PInterface *inf = new IO80211P2PInterface;
-        if (inf == NULL)
-            return kIOReturnError;
-        memcpy(addr.octet, data->mac, 6);
-        inf->init(this, &addr, data->role, "awdl");
+    }
+    if (*slot != NULL) {   // already created: do not leak or replace the live one
+        XYLog("%s %s interface already exists!\n", __FUNCTION__, vifName);
+        return kIOReturnSuccess;
+    }
+
+    IO80211P2PInterface *inf = new IO80211P2PInterface;
+    if (inf == NULL)
+        return kIOReturnError;
+    if (!inf->init(this, &addr, data->role, vifName)) {
+        inf->release();
+        return kIOReturnError;
+    }
+#if __IO80211_TARGET < __MAC_13_0
+    // Pre-Ventura only: forcing a fake infra channel here is a suspect for Ventura's slow join,
+    // so it is skipped there (AWDL is a stub on this hardware anyway).
+    if (data->role == APPLE80211_VIF_AWDL) {
+        struct apple80211_channel chann;
         chann.channel = 149;
         chann.version = 1;
         chann.flags = APPLE80211_C_FLAG_5GHZ | APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_80MHZ;
         setInfraChannel(&chann);
-        fAWDLInterface = inf;
-    } else {
-        XYLog("%s unhandled virtual interface role type: %d\n", __FUNCTION__, data->role);
-        return kIOReturnError;
     }
-    return kIOReturnSuccess;
 #endif
+    *slot = inf;
+    return kIOReturnSuccess;
 }
 
 IOReturn AirportItlwm::
 setVIRTUAL_IF_DELETE(OSObject *object, struct apple80211_virt_if_delete_data *data)
 {
-    XYLog("%s bsd_name=%s\n", __FUNCTION__, data->bsd_name);
-    //TODO find vif according to the bsd_name
+    XYLog("%s bsd_name=%s\n", __FUNCTION__, data ? (const char *)data->bsd_name : "?");
     IO80211VirtualInterface *vif = OSDynamicCast(IO80211VirtualInterface, object);
     if (vif == NULL)
         return kIOReturnError;
+    // wifid deletes and recreates these around sleep/wake. Clear our pointer first, otherwise
+    // setLinkStateGated() later touches a freed interface.
+    if ((IO80211VirtualInterface *)fAWDLInterface == vif)
+        fAWDLInterface = NULL;
+    if ((IO80211VirtualInterface *)fP2PDISCInterface == vif)
+        fP2PDISCInterface = NULL;
+    if ((IO80211VirtualInterface *)fP2PGOInterface == vif)
+        fP2PGOInterface = NULL;
     detachVirtualInterface(vif, false);
     vif->release();
     return kIOReturnSuccess;

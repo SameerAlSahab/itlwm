@@ -548,21 +548,23 @@ UInt32 AirportItlwm::outputPacket(mbuf_t m, void *param)
             freePacket(m);
         return kIOReturnOutputDropped;
     }
+    // Every bad-packet case must return: continuing would dereference NULL or
+    // enqueue an mbuf that was just freed.
     if (m == NULL) {
         XYLog("%s m==NULL!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     if (!(mbuf_flags(m) & MBUF_PKTHDR) ){
         XYLog("%s pkthdr is NULL!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
         freePacket(m);
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     if (mbuf_type(m) == MBUF_TYPE_FREE) {
         XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
+        return kIOReturnOutputDropped;
     }
     size_t len = mbuf_len(m);
     ether_header_t *eh = (ether_header_t *)mbuf_data(m);
@@ -1049,5 +1051,8 @@ void AirportItlwm::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOn;
+    // See the legacy driver: the adapter was stopped in setPowerStateOff() and nothing else restarts it.
+    if (bsdInterface && power_state)
+        enableAdapter(bsdInterface);
     pmPolicyMaker->acknowledgeSetPowerState();
 }

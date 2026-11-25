@@ -104,6 +104,8 @@ void AirportItlwmSkywalkInterface::associateSSID(uint8_t *ssid, uint32_t ssid_le
     bzero(&wpa, sizeof(wpa));
     bzero(&nwkey, sizeof(nwkey));
     
+    if (ssid_len > IEEE80211_NWID_LEN)
+        ssid_len = IEEE80211_NWID_LEN;
     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
     memcpy(ic->ic_des_essid, ssid, ssid_len);
     ic->ic_des_esslen = ssid_len;
@@ -295,8 +297,10 @@ getSSID(struct apple80211_ssid_data *sd)
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(sd, 0, sizeof(*sd));
         sd->version = APPLE80211_VERSION;
-        memcpy(sd->ssid_bytes, ic->ic_des_essid, strlen((const char*)ic->ic_des_essid));
-        sd->ssid_len = (uint32_t)strlen((const char*)ic->ic_des_essid);
+        // strlen() overruns for a 32 byte SSID (no NUL) and truncates SSIDs with NULs.
+        uint32_t n = ic->ic_des_esslen > IEEE80211_NWID_LEN ? IEEE80211_NWID_LEN : ic->ic_des_esslen;
+        memcpy(sd->ssid_bytes, ic->ic_des_essid, n);
+        sd->ssid_len = n;
         return kIOReturnSuccess;
     }
     return 6;
@@ -323,9 +327,16 @@ IOReturn AirportItlwmSkywalkInterface::
 setCIPHER_KEY(struct apple80211_key *key)
 {
     XYLog("%s\n", __FUNCTION__);
+#ifdef DEBUG
     const char* keydump = hexdump(key->key, key->key_len);
     const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
     const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
+#else
+    // Never write PTK/GTK key material to the log in release builds.
+    const char* keydump = nullptr;
+    const char* rscdump = nullptr;
+    const char* eadump = nullptr;
+#endif
     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
@@ -335,7 +346,8 @@ setCIPHER_KEY(struct apple80211_key *key)
         XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
               key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
     else
-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
+        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d\n",
+              key->key_len, key->key_cipher_type, key->key_flags, key->key_index);
     
     if (keydump)
         IOFree((void*)keydump, 3 * key->key_len + 1);
@@ -729,6 +741,8 @@ getNSS(struct apple80211_nss_data *data)
 IOReturn AirportItlwmSkywalkInterface::
 setASSOCIATE(struct apple80211_assoc_data *ad)
 {
+    if (!ad)
+        return kIOReturnError;
     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
@@ -847,6 +861,8 @@ getASSOCIATION_STATUS(struct apple80211_assoc_status_data *hv)
     hv->version = APPLE80211_VERSION;
     if (ic->ic_state == IEEE80211_S_RUN)
         hv->status = APPLE80211_STATUS_SUCCESS;
+    else if (ic->ic_assoc_status != 0 && ic->ic_assoc_status != APPLE80211_STATUS_UNAVAILABLE)
+        hv->status = ic->ic_assoc_status;   // real status code from the AP's (re)association response
     else
         hv->status = APPLE80211_STATUS_UNAVAILABLE;
 //    XYLog("%s, %d\n", __FUNCTION__, hv->status);

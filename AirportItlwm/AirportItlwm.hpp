@@ -270,6 +270,7 @@ public:
     IO80211P2PInterface *fP2PDISCInterface;
     IO80211P2PInterface *fP2PGOInterface;
     IO80211P2PInterface *fAWDLInterface;
+    bool fDisableVirtualIf;
     
     //AWDL
     uint8_t *syncFrameTemplate;
